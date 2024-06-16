@@ -34,7 +34,7 @@ https://github.com/jamesparsloe/llm.speech/assets/13669398/a9e1bcf0-ac81-4cbe-95
 ```sh
 python3.11 -m venv env
 source env/bin/activate
-python -m pip install -e .[dev]
+python -m pip install -e ".[dev]"
 ```
 
 ## Training
