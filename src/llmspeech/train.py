@@ -1,20 +1,27 @@
+import math
 import os
-import time
 from functools import partial
 
 import click
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 import yaml
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
-import wandb
-from llmspeech.dataset import MLS_ENG_DATASET_DIR, SNACDataset
-from llmspeech.utils import cycle, warmup_then_cosine_decay
+from llmspeech.dataset import SNACDataset
+from llmspeech.utils import warmup_then_cosine_decay
+
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import set_seed
+
 
 from .config import Config
-from .model import GPT, build_optimizer
+from .model import GPT
+
+logger = get_logger(__name__, log_level="DEBUG")
 
 
 def collate(items, pad_token_id: int):
@@ -32,70 +39,85 @@ def collate(items, pad_token_id: int):
 def main(config_path: str, edit: bool):
     with open(config_path) as f:
         s = f.read()
-
         if edit:
             s = click.edit(s)
+            s = s if s is not None else ""
 
         config = Config(**yaml.safe_load(s))
 
-    device = "cuda"
-
-    run = wandb.init(project="llm.speech", config=config.model_dump())
-
-    run_dir = os.path.join("./runs", run.id)
-    os.makedirs(run_dir, exist_ok=True)
-
-    with open(os.path.join(run_dir, "config.yaml"), "w") as f:
-        f.write(yaml.dump(config.model_dump()))
-
+    gradient_accumulation_steps = config.grad_accumulation_steps
+    lr = config.lr
+    seed = int(config.seed or 42)
+    batch_size = int(config.batch_size)
+    betas = config.betas
     kind = config.kind
+    weight_decay = config.weight_decay
+
+    accelerator = Accelerator(
+        project_dir="./runs",
+        mixed_precision="bf16",
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        log_with="wandb",
+    )
+    device = accelerator.device
+    # TODO(julien): Check if we need to rescale the learning rate
+    lr *= accelerator.num_processes
+    accelerator.init_trackers(project_name="llm.speech", config=config.model_dump())
+    run = accelerator.get_tracker("wandb")
+    # run_dir = os.path.join(accelerator.logging_dir, run.id)
+    os.makedirs(accelerator.logging_dir, exist_ok=True)
+    set_seed(42)
 
     assert kind == "gpt"
 
-    model = GPT(config).to(device)
-    weight_decay = config.weight_decay
-    lr = config.lr
-    betas = config.betas
+    model = GPT(config)
 
     if config.checkpoint_path is not None:
-        checkpoint = torch.load(config.checkpoint_path)
-        pretrained_step = checkpoint["step"]
-        print(f"Restoring model from step {pretrained_step}")
-        state_dict = {
-            k: v for k, v in checkpoint["model"].items() if "rotary_emb" not in k
-        }
-        model.load_state_dict(state_dict, strict=True)
+        with accelerator.main_process_first():
+            # TODO(julien): accelerator.load_state ?
+            checkpoint = torch.load(config.checkpoint_path)
+            pretrained_step = checkpoint["step"]
+            logger.info(
+                f"Restoring model from step {pretrained_step}", main_process_only=True
+            )
+            state_dict = {
+                k: v for k, v in checkpoint["model"].items() if "rotary_emb" not in k
+            }
+            model.load_state_dict(state_dict, strict=True)
 
     # TODO(james) what's the thinking on loading the optimizer nowadays for finetuning?
-    optimizer = build_optimizer(model, weight_decay=weight_decay, lr=lr, betas=betas)
+    optimizer = torch.optim.AdamW(
+        params=model.parameters(), lr=lr, betas=betas, fused=False
+    )
 
     dataset_dir = os.path.join(os.path.expanduser("~/.cache/datasets"), config.dataset)
     assert os.path.exists(
         dataset_dir
     ), f"Please make sure you ran the correct preprocess script for {config.dataset}!"
 
-    dataset = SNACDataset(
-        dataset_dir,
-        with_style_prompts=config.with_style_prompts,
-        n_text_tokens=config.n_text_tokens,
-        codebook_size=config.codebook_size,
-        bos_token_id=config.bos_token_id,
-        boa_token_id=config.boa_token_id,
-        eos_token_id=config.eos_token_id,
-    )
+    with accelerator.main_process_first():
+        dataset = SNACDataset(
+            dataset_dir,
+            with_style_prompts=config.with_style_prompts,
+            n_text_tokens=config.n_text_tokens,
+            codebook_size=config.codebook_size,
+            bos_token_id=config.bos_token_id,
+            boa_token_id=config.boa_token_id,
+            eos_token_id=config.eos_token_id,
+        )
+        n_items = len(dataset)
+        epoch_size = n_items // batch_size
+        logger.info(
+            f"Dataset consists of {n_items} items. This is {epoch_size} steps per epoch.",
+            main_process_only=True,
+        )
 
-    n_items = len(dataset)
-    epoch_size = n_items // config.batch_size
-
-    print(f"Dataset consists of {n_items} items. This is {epoch_size} steps per epoch.")
-
-    gradient_accumulation_steps = config.grad_accumulation_steps
     dl = DataLoader(
         dataset,
         batch_size=config.micro_batch_size,
         shuffle=True,
         collate_fn=partial(collate, pad_token_id=config.pad_token_id),
-        num_workers=config.micro_batch_size,
+        num_workers=8,
     )
     log_every = 10
 
@@ -103,8 +125,6 @@ def main(config_path: str, edit: bool):
     steps = config.steps
     checkpoint_every = config.checkpoint_every
     warmup_steps = config.warmup_steps
-
-    batch_size = config.batch_size
 
     get_lr = partial(
         warmup_then_cosine_decay,
@@ -114,78 +134,104 @@ def main(config_path: str, edit: bool):
         max_lr=lr,
     )
 
-    amp_dtype = torch.bfloat16
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
-    dl_iter = cycle(dl)
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, dl, lr_scheduler
+    )
 
-    max_grad_norm = config.max_grad_norm
+    # accelerator.register_for_checkpointing(config)
+    # accelerator.save_state("model")
+
+    model.train()
     step = 0
+    epochs = math.ceil(steps / epoch_size)
+    progress_bar = tqdm(
+        range(steps),
+        desc="Steps",
+        position=0,
+        disable=not accelerator.is_local_main_process,
+    )
 
-    while step < steps:
-        lr = get_lr(step)
+    for epoch in range(epochs):
+        with accelerator.autocast():
+            for index, token_ids in enumerate(train_dataloader):
+                B, T = token_ids.size()
+                if T > config.max_seqlen:
+                    accelerator.print(
+                        f"Warning! Sequence with length {T} is longer than {config.max_seqlen} - truncating!"
+                    )
+                    token_ids = token_ids[:, : config.max_seqlen]
 
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-
-        t1 = time.perf_counter()
-
-        for microstep in range(gradient_accumulation_steps):
-            token_ids = next(dl_iter)
-
-            B, T = token_ids.size()
-
-            # HACK(james) filter this in dataset or a better way!
-            if T > config.max_seqlen:
-                print(
-                    f"Warning! Sequence with length {T} is longer than {config.max_seqlen} - truncating!"
+                input_ids, target_ids = (
+                    token_ids[..., :-1],
+                    token_ids[..., 1:].contiguous(),
                 )
-                token_ids = token_ids[:, : config.max_seqlen]
 
-            token_ids = token_ids.to(device)
-            input_ids, target_ids = token_ids[..., :-1], token_ids[..., 1:].contiguous()
+                with accelerator.accumulate(model):
+                    # with contextlib.nullcontext():
+                    logits = model(input_ids=input_ids)
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        target_ids.view(-1),
+                        ignore_index=config.pad_token_id,
+                    )
+                    # loss = loss / gradient_accumulation_steps
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        grad_norm = accelerator.clip_grad_norm_(
+                            model.parameters(), config.max_grad_norm
+                        )
+                    else:
+                        grad_norm = None
 
-            with torch.amp.autocast(dtype=amp_dtype, device_type="cuda", enabled=True):
-                logits = model(input_ids=input_ids)
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    target_ids.view(-1),
-                    ignore_index=config.pad_token_id,
-                )
-                loss = loss / gradient_accumulation_steps
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
-            loss.backward()
+                    if accelerator.sync_gradients:
+                        progress_bar.update(1)
+                        step += 1
+                        # Checks if the accelerator has performed an optimization step behind the scenes
+                        # if accelerator.sync_gradients and accelerator.is_main_process:
+                        if step % log_every == 0:
+                            accelerator.log(
+                                {
+                                    "train/loss": gradient_accumulation_steps
+                                    * loss.item(),
+                                    "train/grad_norm": grad_norm.item()
+                                    if isinstance(grad_norm, torch.Tensor)
+                                    else None,
+                                    # "train/throughput": batch_size / (t2 - t1),
+                                    "train/lr": lr_scheduler.get_lr(),
+                                },
+                                step=step,
+                            )
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        if step % checkpoint_every == 0:
+                            checkpoint_path = os.path.join(
+                                accelerator.logging_dir, f"{kind}-{step:06d}.pt"
+                            )
+                            accelerator.print(
+                                f"Savings checkpoint to {checkpoint_path}"
+                            )
+                            accelerator.save(
+                                {
+                                    "config": config.model_dump(),
+                                    "step": step,
+                                    "model": model.state_dict(),
+                                    "optimizer": optimizer.state_dict(),
+                                },
+                                checkpoint_path,
+                            )
+                            # accelerator.save_state(
+                            #     accelerator.logging_dir + f"/{kind}-{step:06d}"
+                            # )
 
-        optimizer.step()
-        optimizer.zero_grad()
+                        if step >= steps:
+                            break
 
-        t2 = time.perf_counter()
-        if step % log_every == 0:
-            wandb.log(
-                {
-                    "train/loss": gradient_accumulation_steps * loss.item(),
-                    "train/grad_norm": grad_norm.item(),
-                    "train/throughput": batch_size / (t2 - t1),
-                    "train/lr": lr,
-                },
-                step=step,
-            )
-
-        step += 1
-
-        if step % checkpoint_every == 0:
-            checkpoint_path = os.path.join(run_dir, f"{kind}-{step:06d}.pt")
-            print(f"Savings checkpoint to {checkpoint_path}")
-            torch.save(
-                {
-                    "config": config.model_dump(),
-                    "step": step,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                },
-                checkpoint_path,
-            )
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1 @@
+python -m accelerate.commands.launch --multi_gpu -m llmspeech.train configs/big.yaml
