@@ -21,7 +21,8 @@ from accelerate.utils import set_seed
 from .config import Config
 from .model import GPT
 
-logger = get_logger(__name__, log_level="DEBUG")
+logger = get_logger(__name__)
+# logger.setLevel("INFO")
 
 
 def collate(items, pad_token_id: int):
@@ -60,11 +61,13 @@ def main(config_path: str, edit: bool):
         log_with="wandb",
     )
     device = accelerator.device
+
     # TODO(julien): Check if we need to rescale the learning rate
-    lr *= accelerator.num_processes
+    # lr = lr * gradient_accumulation_steps * batch_size * accelerator.num_processes
     accelerator.init_trackers(project_name="llm.speech", config=config.model_dump())
     run = accelerator.get_tracker("wandb")
-    # run_dir = os.path.join(accelerator.logging_dir, run.id)
+    # run = cast(WandBTracker, run)
+    # run_dir = os.path.join(accelerator.logging_dir, run.tracker.id)
     os.makedirs(accelerator.logging_dir, exist_ok=True)
     set_seed(42)
 
@@ -77,8 +80,8 @@ def main(config_path: str, edit: bool):
             # TODO(julien): accelerator.load_state ?
             checkpoint = torch.load(config.checkpoint_path)
             pretrained_step = checkpoint["step"]
-            logger.info(
-                f"Restoring model from step {pretrained_step}", main_process_only=True
+            accelerator.print(
+                f"Restoring model from step {pretrained_step}",
             )
             state_dict = {
                 k: v for k, v in checkpoint["model"].items() if "rotary_emb" not in k
@@ -86,8 +89,9 @@ def main(config_path: str, edit: bool):
             model.load_state_dict(state_dict, strict=True)
 
     # TODO(james) what's the thinking on loading the optimizer nowadays for finetuning?
+    print(lr)
     optimizer = torch.optim.AdamW(
-        params=model.parameters(), lr=lr, betas=betas, fused=False
+        params=model.parameters(), lr=1.0, betas=betas, fused=False
     )
 
     dataset_dir = os.path.join(os.path.expanduser("~/.cache/datasets"), config.dataset)
@@ -107,9 +111,8 @@ def main(config_path: str, edit: bool):
         )
         n_items = len(dataset)
         epoch_size = n_items // batch_size
-        logger.info(
-            f"Dataset consists of {n_items} items. This is {epoch_size} steps per epoch.",
-            main_process_only=True,
+        accelerator.print(
+            f"Dataset consists of {n_items} items. This is {epoch_size} batch per epoch."
         )
 
     dl = DataLoader(
@@ -136,9 +139,22 @@ def main(config_path: str, edit: bool):
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, dl, lr_scheduler
+    model, optimizer, train_dataloader, _ = accelerator.prepare(
+        model, optimizer, dl, None
     )
+
+    total_batch_size = (
+        batch_size * accelerator.num_processes * gradient_accumulation_steps
+    )
+
+    accelerator.print("***** Running training *****")
+    accelerator.print(f"  Num examples = {len(dataset)}")
+    accelerator.print(f"  Instantaneous batch size per device = {batch_size}")
+    accelerator.print(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
+    accelerator.print(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
+    accelerator.print(f"  Total optimization steps = {steps}")
 
     # accelerator.register_for_checkpointing(config)
     # accelerator.save_state("model")
@@ -152,14 +168,15 @@ def main(config_path: str, edit: bool):
         position=0,
         disable=not accelerator.is_local_main_process,
     )
-
-    for epoch in range(epochs):
-        with accelerator.autocast():
+    # https://github.com/huggingface/accelerate/blob/main/examples/by_feature/megatron_lm_gpt_pretraining.py
+    with accelerator.autocast():
+        for epoch in range(epochs):
             for index, token_ids in enumerate(train_dataloader):
                 B, T = token_ids.size()
                 if T > config.max_seqlen:
-                    accelerator.print(
-                        f"Warning! Sequence with length {T} is longer than {config.max_seqlen} - truncating!"
+                    logger.debug(
+                        f"Warning! Sequence with length {T} is longer than {config.max_seqlen} - truncating! (index {index})",
+                        main_process_only=False,
                     )
                     token_ids = token_ids[:, : config.max_seqlen]
 
@@ -169,67 +186,68 @@ def main(config_path: str, edit: bool):
                 )
 
                 with accelerator.accumulate(model):
-                    # with contextlib.nullcontext():
                     logits = model(input_ids=input_ids)
                     loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         target_ids.view(-1),
                         ignore_index=config.pad_token_id,
                     )
-                    # loss = loss / gradient_accumulation_steps
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         grad_norm = accelerator.clip_grad_norm_(
                             model.parameters(), config.max_grad_norm
                         )
-                    else:
-                        grad_norm = None
-
                     optimizer.step()
-                    lr_scheduler.step()
                     optimizer.zero_grad()
 
-                    if accelerator.sync_gradients:
-                        progress_bar.update(1)
-                        step += 1
-                        # Checks if the accelerator has performed an optimization step behind the scenes
-                        # if accelerator.sync_gradients and accelerator.is_main_process:
-                        if step % log_every == 0:
-                            accelerator.log(
-                                {
-                                    "train/loss": gradient_accumulation_steps
-                                    * loss.item(),
-                                    "train/grad_norm": grad_norm.item()
-                                    if isinstance(grad_norm, torch.Tensor)
-                                    else None,
-                                    # "train/throughput": batch_size / (t2 - t1),
-                                    "train/lr": lr_scheduler.get_lr(),
-                                },
-                                step=step,
-                            )
+                if accelerator.sync_gradients:
+                    # Here only each (gradient_accumulation_steps)
+                    current_loss = loss.item()
+                    current_grad_norm = (
+                        grad_norm.item()
+                        if isinstance(grad_norm, torch.Tensor)
+                        else None
+                    )
+                    current_lr = lr_scheduler.get_lr()
+                    current_lr = (
+                        current_lr[0] if isinstance(current_lr, list) else current_lr
+                    )
+                    progress_bar.set_postfix_str(
+                        f"loss: {current_loss:.4f}, lr: {current_lr:.4e}"
+                    )
+                    progress_bar.update(1)
+                    step += 1
+                    lr_scheduler.step()
 
-                        if step % checkpoint_every == 0:
-                            checkpoint_path = os.path.join(
-                                accelerator.logging_dir, f"{kind}-{step:06d}.pt"
-                            )
-                            accelerator.print(
-                                f"Savings checkpoint to {checkpoint_path}"
-                            )
-                            accelerator.save(
-                                {
-                                    "config": config.model_dump(),
-                                    "step": step,
-                                    "model": model.state_dict(),
-                                    "optimizer": optimizer.state_dict(),
-                                },
-                                checkpoint_path,
-                            )
-                            # accelerator.save_state(
-                            #     accelerator.logging_dir + f"/{kind}-{step:06d}"
-                            # )
+                    # Checks if the accelerator has performed an optimization step behind the scenes
+                    # if accelerator.sync_gradients and accelerator.is_main_process:
+                    if accelerator.is_main_process and step % log_every == 0:
+                        accelerator.log(
+                            {
+                                "train/loss": current_loss,
+                                "train/grad_norm": current_grad_norm,
+                                # "train/throughput": batch_size / (t2 - t1),
+                                "train/lr": current_lr,
+                            },
+                            step=step,
+                        )
 
-                        if step >= steps:
-                            break
+                    if accelerator.is_main_process and step % checkpoint_every == 0:
+                        checkpoint_path = os.path.join(
+                            accelerator.logging_dir, f"{kind}-{step:06d}.pt"
+                        )
+                        accelerator.print(f"Savings checkpoint to {checkpoint_path}")
+                        accelerator.wait_for_everyone()
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        accelerator.save(
+                            {
+                                "config": config.model_dump(),
+                                "step": step,
+                                "model": unwrapped_model.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                            },
+                            checkpoint_path,
+                        )
 
     accelerator.end_training()
 
